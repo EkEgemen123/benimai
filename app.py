@@ -9,12 +9,14 @@ import time
 from collections import defaultdict
 import re
 import json
+import requests as http_requests
+from urllib.parse import urlparse
 from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
 
 # ══════════════════════════════════════════════
-# CORS — Streaming ile uyumlu tam ayar
+# CORS — Math Canavarı sistemi (saf manuel)
 # ══════════════════════════════════════════════
 CORS(app,
     resources={r"/*": {"origins": "*"}},
@@ -24,29 +26,30 @@ CORS(app,
     expose_headers=["Content-Type", "Transfer-Encoding", "X-Accel-Buffering"]
 )
 
-# ✅ KRİTİK: Her response'a CORS header ekle
-# Streaming'de flask_cors bazen header ekleyemiyor
-# Bu @after_request onu garanti altına alır
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = Response()
+        response.headers['Access-Control-Allow-Origin']  = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        response.headers['Access-Control-Max-Age']       = '3600'
+        return response
+
 @app.after_request
 def add_cors(response):
     response.headers['Access-Control-Allow-Origin']  = '*'
     response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-    response.headers['Access-Control-Expose-Headers'] = 'Content-Type, Transfer-Encoding'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
     return response
 
-# ✅ KRİTİK: Preflight OPTIONS isteklerini yakala
-# Tarayıcı POST'tan önce OPTIONS gönderiyor
-# Eğer bu cevaplanmazsa CORS hatası veriyor
-@app.before_request
-def handle_preflight():
-    if request.method == 'OPTIONS':
-        resp = Response('', status=200)
-        resp.headers['Access-Control-Allow-Origin']  = '*'
-        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With'
-        resp.headers['Access-Control-Max-Age']       = '86400'
-        return resp
+@app.errorhandler(Exception)
+def handle_error(error):
+    print(f"HATA: {str(error)}")
+    traceback.print_exc()
+    response = Response(f"Sunucu Hatasi: {str(error)}", status=500)
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    return response
 
 # ══════════════════════════════════════════════
 # CONFIG
@@ -213,7 +216,7 @@ def build_chat_history(history_json):
     return cleaned
 
 # ══════════════════════════════════════════════
-# ✅ STREAMING GENERATOR
+# STREAMING GENERATOR
 # ══════════════════════════════════════════════
 def stream_response(chat_session, parts):
     try:
@@ -223,18 +226,15 @@ def stream_response(chat_session, parts):
         for chunk in response:
             if not chunk.text:
                 continue
-
             char_buffer += chunk.text
             tokens       = char_buffer.split(' ')
             char_buffer  = tokens[-1]
-
             for token in tokens[:-1]:
                 if not token:
                     continue
                 yield token + ' '
                 time.sleep(WORD_DELAY)
 
-        # Son kalan parçayı gönder
         if char_buffer.strip():
             yield char_buffer
 
@@ -244,27 +244,22 @@ def stream_response(chat_session, parts):
         yield f"\n\n⚠️ Streaming hatası: {str(e)}"
 
 # ══════════════════════════════════════════════
-# ✅ STREAMING RESPONSE BUILDER
-# CORS header'larını streaming'den ÖNCE set eder
+# STREAMING RESPONSE BUILDER
+# Math Canavarı + Kaya AI birleşik CORS sistemi
 # ══════════════════════════════════════════════
 def make_stream_response(generator):
-    """
-    Streaming response oluştururken CORS header'larını
-    en başa yerleştirir — Render proxy'si header'ı kaybetmez.
-    """
     resp = Response(
         stream_with_context(generator),
         status=200,
         content_type='text/plain; charset=utf-8',
     )
-    # ✅ Header'ları direkt response objesine yaz
     resp.headers['Access-Control-Allow-Origin']   = '*'
     resp.headers['Access-Control-Allow-Methods']  = 'GET, POST, OPTIONS'
-    resp.headers['Access-Control-Allow-Headers']  = 'Content-Type'
+    resp.headers['Access-Control-Allow-Headers']  = 'Content-Type, Accept, Origin, X-Requested-With'
+    resp.headers['Access-Control-Expose-Headers'] = 'Content-Type, Transfer-Encoding'
     resp.headers['Cache-Control']                 = 'no-cache, no-store, must-revalidate'
     resp.headers['X-Accel-Buffering']             = 'no'
     resp.headers['X-Content-Type-Options']        = 'nosniff'
-    # Chunked transfer
     resp.headers['Transfer-Encoding']             = 'chunked'
     return resp
 
@@ -274,7 +269,7 @@ def make_stream_response(generator):
 @app.route("/", methods=["GET"])
 def index():
     return Response(
-        "Kaya AI API v5.4 — CORS + Streaming Fixed\n"
+        "Kaya AI API v5.5 — Math Canavarı CORS + Streaming\n"
         f"Gemini: {'OK' if GEMINI_API_KEY else 'MISSING'}",
         status=200,
         content_type='text/plain; charset=utf-8'
@@ -285,12 +280,12 @@ def health():
     return jsonify({
         "status":          "OK",
         "turkey_time":     get_turkey_time_info()["full"],
-        "version":         "5.4",
+        "version":         "5.5",
         "gemini":          bool(GEMINI_API_KEY),
         "streaming":       True,
         "history_support": True,
         "words_per_sec":   WORDS_PER_SECOND,
-        "cors":            "fixed",
+        "cors":            "math-canavar-style",
     })
 
 @app.route("/time", methods=["GET"])
@@ -302,13 +297,12 @@ def get_time():
 # ══════════════════════════════════════════════
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
-    # OPTIONS preflight — tarayıcı önce bunu gönderiyor
     if request.method == 'OPTIONS':
         resp = Response('', status=200)
         resp.headers['Access-Control-Allow-Origin']  = '*'
-        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-        resp.headers['Access-Control-Max-Age']       = '86400'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        resp.headers['Access-Control-Max-Age']       = '3600'
         return resp
 
     if not GEMINI_API_KEY:
@@ -376,7 +370,6 @@ def chat():
         if not current_parts:
             return Response("İçerik işlenemedi!", status=400)
 
-        # ✅ make_stream_response ile CORS header garantili
         return make_stream_response(
             stream_response(chat_session, current_parts)
         )
@@ -394,8 +387,9 @@ def chat_sync():
     if request.method == 'OPTIONS':
         resp = Response('', status=200)
         resp.headers['Access-Control-Allow-Origin']  = '*'
-        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        resp.headers['Access-Control-Max-Age']       = '3600'
         return resp
 
     if not GEMINI_API_KEY:
@@ -455,7 +449,9 @@ def chat_sync():
         result = chat_session.send_message(current_parts)
 
         resp = Response(result.text, status=200, content_type='text/plain; charset=utf-8')
-        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Origin']  = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
         return resp
 
     except Exception as e:
@@ -471,8 +467,9 @@ def analyze_image():
     if request.method == 'OPTIONS':
         resp = Response('', status=200)
         resp.headers['Access-Control-Allow-Origin']  = '*'
-        resp.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
-        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, Accept, Origin, X-Requested-With'
+        resp.headers['Access-Control-Max-Age']       = '3600'
         return resp
 
     if not GEMINI_API_KEY:
@@ -536,7 +533,8 @@ def analyze_image():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     print("=" * 55)
-    print("  Kaya AI API v5.4 — CORS + Streaming Fixed")
+    print("  Kaya AI API v5.5")
+    print("  CORS: Math Canavarı Sistemi ✅")
     print("=" * 55)
     print(f"  Port        : {port}")
     print(f"  Gemini      : {'✅' if GEMINI_API_KEY else '❌ YOK'}")
@@ -544,6 +542,6 @@ if __name__ == "__main__":
     print(f"  Max History : {MAX_HISTORY_MESSAGES} mesaj")
     print(f"  Yazma hızı  : {WORDS_PER_SECOND} kelime/sn ({WORD_DELAY:.3f}s)")
     print(f"  Streaming   : ✅")
-    print(f"  CORS        : ✅ Streaming uyumlu")
+    print(f"  CORS        : ✅ Math Canavarı Sistemi")
     print("=" * 55)
     app.run(host='0.0.0.0', port=port, debug=False)
