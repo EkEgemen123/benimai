@@ -9,6 +9,8 @@ from collections import defaultdict
 import re
 import json
 from datetime import datetime, timezone, timedelta
+import threading
+import queue
 
 app = Flask(__name__)
 
@@ -46,9 +48,11 @@ if GEMINI_API_KEY:
 else:
     print("❌ HATA: GEMINI_API_KEY bulunamadı!")
 
-MODEL_NAME     = "gemini-2.5-flash"
-MAX_MSG_LENGTH = 10000000
+MODEL_NAME      = "gemini-2.5-flash"
+MAX_MSG_LENGTH  = 10000000
 MAX_IMAGE_SIZE_MB = 10
+MAX_HISTORY_MESSAGES = 40          # <-- ekledim
+WORDS_PER_SECOND = 4               # <-- yeni: saniyede 4 kelime
 
 # ========================= ZAMAN =========================
 def get_turkey_time_info():
@@ -219,7 +223,7 @@ def health():
 def get_time():
     return jsonify(get_turkey_time_info())
 
-# ========================= STREAMING CHAT =========================
+# ========================= STREAMING CHAT (GÜNCELLENDİ) =========================
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
     if not GEMINI_API_KEY:
@@ -299,7 +303,7 @@ def chat():
         if not current_parts:
             return Response("İçerik işlenemedi!", status=400)
 
-        # STREAMING yanıt
+        # ───── YENİ: Kelime bazlı yavaş akış jeneratörü ─────
         def generate():
             try:
                 response = chat_session.send_message(
@@ -307,9 +311,42 @@ def chat():
                     stream=True
                 )
 
-                for chunk in response:
-                    if chunk.text:
-                        yield chunk.text
+                q = queue.Queue()
+                done = threading.Event()
+
+                # Arka planda Gemini’den gelen tüm chunk’ları hızlıca topla
+                def fetch():
+                    try:
+                        for chunk in response:
+                            if chunk.text:
+                                q.put(chunk.text)
+                    finally:
+                        done.set()
+
+                t = threading.Thread(target=fetch)
+                t.start()
+
+                buffer = ""
+                while not done.is_set() or not q.empty() or buffer:
+                    try:
+                        text = q.get(timeout=0.05)
+                        buffer += text
+                    except queue.Empty:
+                        pass
+
+                    # Buffer'daki kelimeleri tek tek gönder
+                    while ' ' in buffer:
+                        word, buffer = buffer.split(' ', 1)
+                        word += ' '
+                        yield word
+                        # Saniyede WORDS_PER_SECOND kelime hızı
+                        time.sleep(1.0 / WORDS_PER_SECOND)
+
+                # Kalan son parça
+                if buffer:
+                    yield buffer
+
+                t.join()
 
             except Exception as e:
                 print(f"[STREAM] Hata: {e}")
@@ -398,7 +435,7 @@ def chat_sync():
         traceback.print_exc()
         return Response(f"AI Hatası: {str(e)}", status=500)
 
-# ========================= VISION =========================
+# ========================= VISION (örnek, isteğe bağlı olarak aynı kelime akışı eklenebilir) =========================
 @app.route("/vision", methods=["POST", "OPTIONS"])
 def analyze_image():
     if not GEMINI_API_KEY:
@@ -460,5 +497,6 @@ if __name__ == "__main__":
     print(f"Gemini: {'✅' if GEMINI_API_KEY else '❌ YOK'}")
     print(f"Model: {MODEL_NAME}")
     print(f"Max History: {MAX_HISTORY_MESSAGES} mesaj")
+    print(f"Yazma hızı: {WORDS_PER_SECOND} kelime/saniye")
     print("=" * 50)
     app.run(host='0.0.0.0', port=port, debug=False)
