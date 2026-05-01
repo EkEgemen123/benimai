@@ -1,4 +1,4 @@
-from flask import Flask, request, Response, jsonify
+from flask import Flask, request, Response, jsonify, stream_with_context
 import google.generativeai as genai
 import os
 from PIL import Image
@@ -7,6 +7,7 @@ import traceback
 import time
 from collections import defaultdict
 import re
+import json
 from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
@@ -88,14 +89,14 @@ KURALLAR:
 - Kodlar basit olmayacak ve bilerek satırları kısaltmak olmadan yazacaksın ve kaliteli profesyonel kodlar tasarlayacaksın"""
 
 # ========================= RATE LİMİTİNG =========================
-ip_request_log  = defaultdict(list)
+ip_request_log = defaultdict(list)
 ip_last_request = defaultdict(float)
-ip_last_msgs    = defaultdict(list)
+ip_last_msgs = defaultdict(list)
 
-RATE_LIMIT_WINDOW   = 60
-RATE_LIMIT_MAX_CHAT = 20
-MIN_MSG_INTERVAL    = 1.5
-SPAM_REPEAT_LIMIT   = 3
+RATE_LIMIT_WINDOW = 60
+RATE_LIMIT_MAX_CHAT = 25
+MIN_MSG_INTERVAL = 1.0
+SPAM_REPEAT_LIMIT = 3
 
 FORBIDDEN_PATTERNS = [
     r"(?i)(prompt\s*inject)",
@@ -110,7 +111,7 @@ def get_client_ip():
     return fwd.split(',')[0].strip() if fwd else (request.remote_addr or '0.0.0.0')
 
 def check_rate_limit(ip):
-    now  = time.time()
+    now = time.time()
     last = ip_last_request[ip]
     if now - last < MIN_MSG_INTERVAL:
         wait = round(MIN_MSG_INTERVAL - (now - last), 1)
@@ -124,7 +125,7 @@ def check_rate_limit(ip):
     return True, ""
 
 def check_spam(ip, message):
-    clean  = message.strip().lower()
+    clean = message.strip().lower()
     recent = ip_last_msgs[ip][-5:]
     if clean and recent.count(clean) >= SPAM_REPEAT_LIMIT:
         return True, "Aynı mesajı tekrar tekrar gönderiyorsunuz."
@@ -139,26 +140,86 @@ def check_content(message):
             return False, "Mesajınız güvenlik filtresine takıldı."
     return True, ""
 
+# ========================= CHAT GEÇMİŞİ OLUŞTUR =========================
+def build_chat_history(history_json):
+    """
+    Frontend'den gelen sohbet geçmişini Gemini formatına çevir.
+    history_json: [{"role": "user"|"ai", "content": "..."}]
+    """
+    gemini_history = []
+
+    if not history_json:
+        return gemini_history
+
+    try:
+        if isinstance(history_json, str):
+            history_list = json.loads(history_json)
+        else:
+            history_list = history_json
+    except (json.JSONDecodeError, TypeError):
+        return gemini_history
+
+    # Son N mesajı al (çok uzun geçmiş token sınırını aşar)
+    history_list = history_list[-MAX_HISTORY_MESSAGES:]
+
+    for msg in history_list:
+        role = msg.get("role", "")
+        content = msg.get("content", "").strip()
+
+        if not content:
+            continue
+
+        # Gemini formatı: "user" ve "model"
+        if role == "user":
+            gemini_history.append({
+                "role": "user",
+                "parts": [content]
+            })
+        elif role in ("ai", "assistant", "model"):
+            gemini_history.append({
+                "role": "model",
+                "parts": [content]
+            })
+
+    # Gemini kuralı: İlk mesaj "user" olmalı, ardışık aynı rol olmamalı
+    cleaned = []
+    for msg in gemini_history:
+        if cleaned and cleaned[-1]["role"] == msg["role"]:
+            # Aynı role ardışık gelirse birleştir
+            cleaned[-1]["parts"][0] += "\n" + msg["parts"][0]
+        else:
+            cleaned.append(msg)
+
+    # İlk mesaj "model" ise kaldır
+    while cleaned and cleaned[0]["role"] == "model":
+        cleaned.pop(0)
+
+    return cleaned
+
 # ========================= ROUTES =========================
 @app.route("/", methods=["GET"])
 def index():
     return Response(
-        f"Kaya Studios API\nGemini: {'OK' if GEMINI_API_KEY else 'MISSING'}",
+        f"Kaya AI API v5.0 — Streaming\nGemini: {'OK' if GEMINI_API_KEY else 'MISSING'}",
         status=200, content_type='text/plain; charset=utf-8'
     )
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({
-        "status":      "OK",
+        "status": "OK",
         "turkey_time": get_turkey_time_info()["full"],
-        "gemini":      bool(GEMINI_API_KEY),
+        "version": "5.0",
+        "gemini": bool(GEMINI_API_KEY),
+        "streaming": True,
+        "history_support": True,
     })
 
 @app.route("/time", methods=["GET"])
 def get_time():
     return jsonify(get_turkey_time_info())
 
+# ========================= STREAMING CHAT =========================
 @app.route("/chat", methods=["POST", "OPTIONS"])
 def chat():
     if not GEMINI_API_KEY:
@@ -171,9 +232,10 @@ def chat():
 
     try:
         user_message = request.form.get('message', '').strip()
-        image_file   = request.files.get('image')
-        user_name    = request.form.get('user_name', '').strip()
-        is_plus      = request.form.get('is_plus', 'false').lower() == 'true'
+        image_file = request.files.get('image')
+        user_name = request.form.get('user_name', '').strip()
+        is_plus = request.form.get('is_plus', 'false').lower() == 'true'
+        history_raw = request.form.get('history', '').strip()
 
         if not user_message and not image_file:
             return Response("Mesaj veya görsel gerekli!", status=400)
@@ -188,8 +250,17 @@ def chat():
             if not ok:
                 return Response(content_err, status=400)
 
-        # ─── GÖRSEL İŞLEME ───
-        parts = []
+        # Sohbet geçmişini parse et
+        chat_history = []
+        if history_raw:
+            try:
+                chat_history = build_chat_history(history_raw)
+                print(f"[CHAT] Geçmiş: {len(chat_history)} mesaj yüklendi")
+            except Exception as e:
+                print(f"[CHAT] Geçmiş parse hatası: {e}")
+
+        # Görsel işleme
+        img_obj = None
         if image_file:
             try:
                 img_data = image_file.read()
@@ -197,34 +268,137 @@ def chat():
                     return Response("Resim dosyası boş.", status=400)
                 if len(img_data) / (1024 * 1024) > MAX_IMAGE_SIZE_MB:
                     return Response(f"Resim çok büyük. Maks {MAX_IMAGE_SIZE_MB}MB.", status=400)
-                img = Image.open(BytesIO(img_data))
-                img.thumbnail((1024, 1024), Image.LANCZOS)
-                parts.append(img)
+                img_obj = Image.open(BytesIO(img_data))
+                img_obj.thumbnail((1024, 1024), Image.LANCZOS)
             except Exception as e:
                 print(f"[CHAT] Görsel hatası: {e}")
                 return Response("Resim okunamadı.", status=400)
 
-        if user_message:
-            parts.append(user_message)
-        if not parts:
-            return Response("İçerik işlenemedi!", status=400)
-
-        # ─── AI YANITI ───
+        # Sistem talimatı
         system_inst = build_system_instruction(
             user_name=user_name or None,
             is_plus=is_plus,
         )
-        model   = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=system_inst)
-        result  = model.generate_content(parts)
-        ai_text = result.text
 
-        return Response(ai_text, status=200, content_type='text/plain; charset=utf-8')
+        # Model oluştur
+        model = genai.GenerativeModel(
+            model_name=MODEL_NAME,
+            system_instruction=system_inst
+        )
+
+        # Chat oturumu başlat (geçmişle birlikte)
+        chat_session = model.start_chat(history=chat_history)
+
+        # Mevcut mesaj parçalarını oluştur
+        current_parts = []
+        if img_obj:
+            current_parts.append(img_obj)
+        if user_message:
+            current_parts.append(user_message)
+
+        if not current_parts:
+            return Response("İçerik işlenemedi!", status=400)
+
+        # STREAMING yanıt
+        def generate():
+            try:
+                response = chat_session.send_message(
+                    current_parts,
+                    stream=True
+                )
+
+                for chunk in response:
+                    if chunk.text:
+                        yield chunk.text
+
+            except Exception as e:
+                print(f"[STREAM] Hata: {e}")
+                traceback.print_exc()
+                yield f"\n\n⚠️ Streaming hatası: {str(e)}"
+
+        return Response(
+            stream_with_context(generate()),
+            status=200,
+            content_type='text/plain; charset=utf-8',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+                'Transfer-Encoding': 'chunked',
+            }
+        )
 
     except Exception as e:
         print(f"[CHAT] HATA: {e}")
         traceback.print_exc()
         return Response(f"AI Hatası: {str(e)}", status=500)
 
+# ========================= NON-STREAMING (fallback) =========================
+@app.route("/chat-sync", methods=["POST", "OPTIONS"])
+def chat_sync():
+    """Streaming desteklemeyen istemciler için fallback endpoint"""
+    if not GEMINI_API_KEY:
+        return Response("Hata: GEMINI_API_KEY yapılandırılmamış!", status=500)
+
+    ip = get_client_ip()
+    allowed, err = check_rate_limit(ip)
+    if not allowed:
+        return Response(err, status=429)
+
+    try:
+        user_message = request.form.get('message', '').strip()
+        image_file = request.files.get('image')
+        user_name = request.form.get('user_name', '').strip()
+        is_plus = request.form.get('is_plus', 'false').lower() == 'true'
+        history_raw = request.form.get('history', '').strip()
+
+        if not user_message and not image_file:
+            return Response("Mesaj veya görsel gerekli!", status=400)
+
+        if user_message:
+            is_spam, spam_err = check_spam(ip, user_message)
+            if is_spam:
+                return Response(spam_err, status=429)
+            ok, content_err = check_content(user_message)
+            if not ok:
+                return Response(content_err, status=400)
+
+        chat_history = []
+        if history_raw:
+            try:
+                chat_history = build_chat_history(history_raw)
+            except Exception:
+                pass
+
+        img_obj = None
+        if image_file:
+            try:
+                img_data = image_file.read()
+                if len(img_data) / (1024 * 1024) > MAX_IMAGE_SIZE_MB:
+                    return Response(f"Resim çok büyük.", status=400)
+                img_obj = Image.open(BytesIO(img_data))
+                img_obj.thumbnail((1024, 1024), Image.LANCZOS)
+            except Exception:
+                return Response("Resim okunamadı.", status=400)
+
+        system_inst = build_system_instruction(user_name=user_name or None, is_plus=is_plus)
+        model = genai.GenerativeModel(model_name=MODEL_NAME, system_instruction=system_inst)
+        chat_session = model.start_chat(history=chat_history)
+
+        current_parts = []
+        if img_obj:
+            current_parts.append(img_obj)
+        if user_message:
+            current_parts.append(user_message)
+
+        result = chat_session.send_message(current_parts)
+        return Response(result.text, status=200, content_type='text/plain; charset=utf-8')
+
+    except Exception as e:
+        print(f"[SYNC] HATA: {e}")
+        traceback.print_exc()
+        return Response(f"AI Hatası: {str(e)}", status=500)
+
+# ========================= VISION =========================
 @app.route("/vision", methods=["POST", "OPTIONS"])
 def analyze_image():
     if not GEMINI_API_KEY:
@@ -240,8 +414,7 @@ def analyze_image():
         if not image_file:
             return Response("Resim dosyası gerekli.", status=400)
 
-        custom_prompt = request.form.get('prompt', '').strip() or \
-            "Bu resmi dikkatlice analiz et. Türkçe yanıtla."
+        custom_prompt = request.form.get('prompt', '').strip() or "Bu resmi analiz et. Türkçe yanıtla."
 
         img_data = image_file.read()
         if not img_data:
@@ -252,10 +425,26 @@ def analyze_image():
         img = Image.open(BytesIO(img_data))
         img.thumbnail((1024, 1024), Image.LANCZOS)
 
-        model    = genai.GenerativeModel(model_name=MODEL_NAME)
-        response = model.generate_content([img, custom_prompt])
+        model = genai.GenerativeModel(model_name=MODEL_NAME)
 
-        return Response(response.text, status=200, content_type='text/plain; charset=utf-8')
+        def generate():
+            try:
+                response = model.generate_content([img, custom_prompt], stream=True)
+                for chunk in response:
+                    if chunk.text:
+                        yield chunk.text
+            except Exception as e:
+                yield f"\n\n⚠️ Hata: {str(e)}"
+
+        return Response(
+            stream_with_context(generate()),
+            status=200,
+            content_type='text/plain; charset=utf-8',
+            headers={
+                'Cache-Control': 'no-cache',
+                'X-Accel-Buffering': 'no',
+            }
+        )
 
     except Exception as e:
         print(f"[VISION] HATA: {e}")
@@ -265,8 +454,11 @@ def analyze_image():
 # ========================= BAŞLAT =========================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    print("=" * 40)
-    print(f"Kaya Studios API — Port {port}")
+    print("=" * 50)
+    print(f"Kaya AI API v5.0 — Streaming + History")
+    print(f"Port: {port}")
     print(f"Gemini: {'✅' if GEMINI_API_KEY else '❌ YOK'}")
-    print("=" * 40)
+    print(f"Model: {MODEL_NAME}")
+    print(f"Max History: {MAX_HISTORY_MESSAGES} mesaj")
+    print("=" * 50)
     app.run(host='0.0.0.0', port=port, debug=False)
