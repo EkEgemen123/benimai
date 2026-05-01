@@ -12,7 +12,14 @@ import json
 from datetime import datetime, timezone, timedelta
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+
+# flask_cors zaten OPTIONS dahil tüm CORS süreçlerini otomatik ve standartlara uygun yönetir.
+CORS(app,
+    resources={r"/*": {"origins": "*"}},
+    allow_headers="*",
+    methods=["GET", "POST", "OPTIONS"],
+    supports_credentials=False
+)
 
 GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '').strip()
 if GEMINI_API_KEY:
@@ -30,9 +37,6 @@ MAX_HISTORY_MESSAGES = 40
 WORDS_PER_SECOND     = 3
 WORD_DELAY           = 1.0 / WORDS_PER_SECOND  # 0.333 saniye
 
-# ──────────────────────────────────────────────
-# ZAMAN
-# ──────────────────────────────────────────────
 def get_turkey_time_info():
     now_tr    = datetime.now(timezone.utc) + timedelta(hours=3)
     days_tr   = ["Pazartesi","Salı","Çarşamba","Perşembe","Cuma","Cumartesi","Pazar"]
@@ -42,7 +46,7 @@ def get_turkey_time_info():
     if   5  <= hour < 12: tod = "sabah"
     elif 12 <= hour < 17: tod = "öğleden sonra"
     elif 17 <= hour < 21: tod = "akşam"
-    else:                  tod = "gece"
+    else:                 tod = "gece"
     return {
         "time_str":    now_tr.strftime("%H:%M"),
         "date_str":    f"{now_tr.day} {months_tr[now_tr.month-1]} {now_tr.year}",
